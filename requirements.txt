@@ -1,0 +1,6 @@
+# 本机实测通过的版本（Python 3.9.13 / Windows）
+# tkinter 是 Python 自带的，不用装；Windows 上用 python.org 的安装包默认就有。
+handright==8.2.0
+Pillow>=10.0
+numpy>=1.24
+opencv-python>=4.8
