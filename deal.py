@@ -3,6 +3,7 @@
 # 1. ~2~ 表示下标：两个 ~ 之间的字符画小并沉到基线以下，如 log~2~V
 # 2. 乘号用 x 而不是 *
 # ==========================================================================
+import math
 import random
 import os
 import cv2
@@ -34,6 +35,21 @@ DEFAULTS = {
     "side_line_width": 3,
     "grain_sigma": 6,
     "grain_alpha": 0.05,
+
+    # --- 用真纸还是生成纸 ---
+    # "gen" = 按上面的参数现画一张；"photo" = 用 paper_image 那张真纸（会缩放到 w×h）
+    "paper_mode": "gen",
+    "paper_image": "",
+
+    # --- 写字区域 ---
+    # 每一块 = {name, text, kind, align_h, align_v, x, y, w, h, size, spacing}
+    #   kind    = "body" 正文（写不下往后翻页）
+    #             "head" 抬头（只在第 1 页出现）
+    #             "headall" 抬头（每一页都写一遍）
+    #   align_h = "left"/"center"/"right"，align_v = "top"/"middle"/"bottom"
+    #             —— 字在框里怎么摆，按块各算各的
+    # 每块各自排版、各自翻页，最后贴回同一张纸。留空 = 整页当一块写，和以前一样。
+    "blocks": [],
 
     # --- 手写抖动 ---
     "fill": (30, 30, 35),       # 墨色：生成的字和手写笔迹共用
@@ -288,8 +304,9 @@ _draw_page = hr_core._draw_page
 
 
 def draw_page_with_header(page, text, start, tpl, rand):
-    # strip() 是为了兼容 """\n姜铭远...\n""" 这种写法，免得第一行先空一行
-    head = hr_core._preprocess_text(page_header).strip()
+    # 有了写字区域，抬头就是其中一块（自己在「纸张」页拖到印好的下划线上），
+    # 再自动拼一遍的话每一块都会被塞一个抬头。
+    head = "" if blocks else hr_core._preprocess_text(page_header).strip()
     if not head:
         return _draw_page(page, text, start, tpl, rand)
     head += "\n"
@@ -300,6 +317,18 @@ def draw_page_with_header(page, text, start, tpl, rand):
 
 
 hr_core._draw_page = draw_page_with_header
+
+# handright 自己的 _get_font 是 max(round(gauss(...)), 0) —— 允许取到 0，
+# 而 font_variant(size=0) 会抛 "font size must be greater than 0"。
+# 小字号 + font_size_sigma 很容易撞上（字号 5、sigma 2 就够了）。这里改成下限 1，
+# 随机数的取用次数和原来完全一致，版面不受影响。
+def get_font_safe(tpl, rand):
+    font = tpl.get_font()
+    size = max(round(hr_core.gauss(rand, font.size, tpl.get_font_size_sigma())), 1)
+    return font.font_variant(size=size) if size != font.size else font
+
+
+hr_core._get_font = get_font_safe
 
 # 每页合成之前，先把墨迹蒙版放出来给你改；改过的就用改过的。
 # page.image 本来就是那张二值墨迹蒙版，直接换掉就行。
@@ -315,9 +344,12 @@ def perturb_and_merge_with_mask(self, page):
         return _perturb_and_merge(self, page)
     mask = Image.open(path)
     if mask.size != page.image.size:
-        raise ValueError(
-            "蒙版 %s 尺寸是 %s，页面是 %s，对不上：删掉重新导出，或按原尺寸改。"
-            % (path, mask.size, page.image.size))
+        # 以前这里是直接 raise，结果一张上次留下的旧蒙版就能把整次出图打断。
+        # 尺寸对不上时按"没这个蒙版"处理更合理：重新导出一份新的。
+        print("提示：蒙版 %s 尺寸是 %s，页面是 %s，对不上 —— 已忽略并重新导出。"
+              % (path, mask.size, page.image.size))
+        page.image.convert("L").save(path)
+        return _perturb_and_merge(self, page)
     if mask.mode in ("RGBA", "LA"):        # 在透明图层上画的情况
         mask = Image.alpha_composite(
             Image.new("RGBA", mask.size, (0, 0, 0, 255)), mask.convert("RGBA"))
@@ -328,6 +360,11 @@ def perturb_and_merge_with_mask(self, page):
 
 if interactive:
     pass                       # 改由弹窗编辑，蒙版文件这条路就不走了
+elif blocks:
+    # 这套蒙版是按页号存一个文件的，而每块区域都从第 0 页开始排、尺寸还各不相同，
+    # 页号会撞在一起，根本对不上。有区域时直接不用它。
+    print("提示：定义了写字区域，mask 文件夹那套手改蒙版用不了"
+          "（每个区域都从第 0 页开始、尺寸还不一样），已跳过。")
 elif seed is None:
     print("提示：seed 是 None，每次版面都不同，手改蒙版功能已关闭。")
 else:
@@ -335,38 +372,182 @@ else:
 
 font = ImageFont.truetype(font_path, size=font_size)
 
-ascent = font.getmetrics()[0]
-y = margin + line_spacing - font_size + ascent
-paper = Image.new(mode="RGB", size=(w, h), color=paper_color)
-draw = ImageDraw.Draw(paper)
-while y < h - 30:
-    draw.line((margin - 24, y, w - 30, y), fill=rule_color, width=rule_width)
-    y += line_spacing
-draw.line((margin - 24, 0, margin - 24, h), fill=side_line_color, width=side_line_width)
 
-if grain_sigma:
-    noise = Image.effect_noise((w, h), grain_sigma).convert("RGB")
-    paper = Image.blend(paper, noise, grain_alpha)
+def build_paper():
+    """纸：要么用真纸图片，要么按参数现画一张。"""
+    if paper_mode == "photo":
+        if paper_image and os.path.exists(paper_image):
+            return Image.open(paper_image).convert("RGB").resize((w, h), Image.LANCZOS)
+        print("提示：找不到纸图片 '%s'，先用生成纸代替。" % paper_image)
+    from paper_tab import make_paper      # 生成纸的画法只有这一份，和设置界面共用
+    return make_paper(globals())
 
-template = Template(
-    background=paper,
-    font=font,
-    line_spacing=line_spacing,
-    fill=fill,
-    left_margin=margin,
-    top_margin=margin,
-    right_margin=margin,
-    bottom_margin=margin,
-    word_spacing=word_spacing,
-    line_spacing_sigma=line_spacing_sigma,
-    font_size_sigma=font_size_sigma,
-    word_spacing_sigma=word_spacing_sigma,
-    start_chars=start_chars,
-    end_chars=end_chars,
-    perturb_x_sigma=perturb_x_sigma,
-    perturb_y_sigma=perturb_y_sigma,
-    perturb_theta_sigma=perturb_theta_sigma,
-)
+
+paper = build_paper()
+
+
+_font_cache = {}
+
+
+def font_at(size):
+    """按字号取字体对象（带缓存：一个字号的 TTF 只开一次）。"""
+    size = int(size)
+    if size not in _font_cache:
+        _font_cache[size] = ImageFont.truetype(font_path, size=size)
+    return _font_cache[size]
+
+
+def make_template(background, size=None, spacing=None):
+    """给一块区域建 Template。边距全 0 —— 区域的矩形本身就是写字范围。
+
+    size/spacing 是这一块自己的字号和行距；不给就用全局的。
+    字号变小，字形的笔画也会跟着变细（那是字体的固有行为，不是笔变细了）。
+    字体对象一律按字号现取，不缓存全局那个 —— 否则改了 font_size 而 font
+    没重建时，两者会不一致，handright 直接报 font.size > line_spacing。
+    """
+    return Template(
+        background=background,
+        font=font_at(size or font_size),
+        line_spacing=line_spacing if spacing is None else spacing,
+        fill=fill,
+        left_margin=0,
+        top_margin=0,
+        right_margin=0,
+        bottom_margin=0,
+        word_spacing=word_spacing,
+        line_spacing_sigma=line_spacing_sigma,
+        font_size_sigma=font_size_sigma,
+        word_spacing_sigma=word_spacing_sigma,
+        start_chars=start_chars,
+        end_chars=end_chars,
+        perturb_x_sigma=perturb_x_sigma,
+        perturb_y_sigma=perturb_y_sigma,
+        perturb_theta_sigma=perturb_theta_sigma,
+    )
+
+
+def effective_blocks():
+    """没画区域就把整页当成一块（边距用 margin），行为和以前一样。"""
+    if blocks:
+        return [b for b in blocks if (b.get("text") or "").strip()]
+    return [{"name": "正文", "text": text, "x": margin, "y": margin,
+             "w": w - 2 * margin, "h": h - 2 * margin}]
+
+
+def align_ink(sub, bg, h_align, v_align, dx=0, dy=0):
+    """把这一块的字在区域里挪到指定位置：靠上/居中/靠下，靠左/居中/靠右。
+
+    dx/dy 是在对齐结果之上再手动微调多少像素 —— 纸印好的横线未必刚好落在
+    行距的整数倍上，光靠上/中/下三段式对不准，得能自己nudge。
+    按"这一块"算 —— 每个区域各管各的。
+    """
+    dx, dy = int(dx or 0), int(dy or 0)
+    if h_align == "left" and v_align == "top" and not dx and not dy:
+        return sub
+    ink = ImageChops.difference(sub, bg).convert("L").point(
+        lambda v: 255 if v > 24 else 0)
+    bb = ink.getbbox()
+    if bb is None:
+        return sub
+    crop = ink.crop(bb)
+    w, h = bg.size
+    cw, ch = crop.size
+    ox = {"left": 0, "center": (w - cw) // 2, "right": w - cw}.get(h_align, 0) + dx
+    oy = {"top": 0, "middle": (h - ch) // 2, "bottom": h - ch}.get(v_align, 0) + dy
+    m = Image.new("L", (w, h), 0)
+    m.paste(crop, (ox, oy))        # 不夹 0：微调可以是负的，超出区域的部分由 PIL 裁掉
+    out = bg.copy()
+    out.paste(fill, (0, 0), m)
+    return out
+
+
+def render_pages():
+    """每块各排各的字，贴回纸上。一块写不下就顺着往后翻页，第 N 块的第 2 页
+    和第 1 块的第 2 页落在同一张纸上。"""
+    out = []
+    every = []                 # "每页都写"的抬头，等页数定了再补
+    for n, b in enumerate(effective_blocks()):
+        x, y = int(b["x"]), int(b["y"])
+        bw, bh = int(b["w"]), int(b["h"])
+        if bw <= 0 or bh <= 0:
+            continue
+        # 这一块自己的字号 / 行距；0 或没写就跟随全局
+        bsize = int(b.get("size") or 0) or None
+        bspace = int(b.get("spacing") or 0) or line_spacing
+        # handright 有两条硬性要求，违反了直接抛 LayoutError：
+        #   ① 行距 ≥ 字号   ② 区域高度 ≥ 行距
+        # 出图时照着兜底并说明，别让整次生成崩掉。
+        if bsize and bsize > bspace:
+            print("提示：区域「%s」字号 %d 大于行距 %d，行距自动提到 %d。"
+                  % (b.get("name") or "?", bsize, bspace, bsize))
+            bspace = bsize
+        if bh < bspace:
+            print("提示：区域「%s」只有 %dpx 高，放不下一行（行距 %d），已跳过。"
+                  % (b.get("name") or "?", bh, bspace))
+            continue
+        tmpl = make_template(paper.crop((x, y, x + bw, y + bh)), bsize, bspace)
+        region_bg = paper.crop((x, y, x + bw, y + bh))
+        ha = b.get("align_h") or "left"
+        va = b.get("align_v") or "top"
+        adx, ady = int(b.get("dx") or 0), int(b.get("dy") or 0)
+        kind = b.get("kind") or "body"
+        # 每块换个种子，免得所有区域的抖动一模一样
+        bseed = None if seed is None else seed + n * 7919
+        if kind == "headall":
+            every.append((b, x, y, region_bg, ha, va, adx, ady, bseed))
+            continue
+        head_only = (kind == "head")
+        for i, sub in enumerate(handwrite(b["text"], tmpl, seed=bseed)):
+            if head_only and i > 0:
+                break               # 抬头只出现在第一页
+            while len(out) <= i:
+                out.append(paper.copy())
+            out[i].paste(align_ink(sub, region_bg, ha, va, adx, ady), (x, y))
+    # 正文排完才知道一共几页，这时再把"每页都写"的抬头补上去
+    npages = max(1, len(out))
+    for (b, x, y, region_bg, ha, va, adx, ady, bseed) in every:
+        bsize = int(b.get("size") or 0) or None
+        bspace = int(b.get("spacing") or 0) or line_spacing
+        if bsize and bsize > bspace:
+            bspace = bsize
+        tmpl = make_template(region_bg, bsize, bspace)
+        for i, sub in enumerate(handwrite(b["text"], tmpl, seed=bseed)):
+            if i >= npages:
+                break
+            out[i].paste(align_ink(sub, region_bg, ha, va, adx, ady), (x, y))
+    return out or [paper.copy()]
+
+
+def perspective_corners(pts1, o, rnd):
+    """把矩形的四个角，按"相机略微转了一下"映射成新的四个角。
+
+    针孔相机模型：内参 K 用一个假想焦距，外参是绕三个轴的小角度旋转，
+    单应矩阵 H = K·R·K⁻¹。
+    以前是四个角各推一个随机量，幅度小的时候结果接近平行四边形 ——
+    对边两两平行，看着像被剪切过，不像拍出来的。相机模型下对边必然收敛。
+    """
+    ang = o / 1400.0                       # o=70 -> 约 2.9°
+    rx = rnd.uniform(-1, 1) * ang
+    ry = rnd.uniform(-1, 1) * ang
+    rz = rnd.uniform(-1, 1) * ang * 0.35   # 滚转小一点，别把纸转歪
+    x0, y0 = float(pts1[0][0]), float(pts1[0][1])
+    x1, y1 = float(pts1[3][0]), float(pts1[3][1])
+    cx0, cy0 = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    f = max(x1 - x0, y1 - y0) * 2.5        # 假想焦距：越大透视越弱
+    K = np.array([[f, 0, cx0], [0, f, cy0], [0, 0, 1]], np.float64)
+    Ki = np.linalg.inv(K)
+
+    def rot(axis, t):
+        c, s = math.cos(t), math.sin(t)
+        if axis == 0:
+            return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], np.float64)
+        if axis == 1:
+            return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], np.float64)
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], np.float64)
+
+    H = K @ rot(2, rz) @ rot(1, ry) @ rot(0, rx) @ Ki
+    return cv2.perspectiveTransform(
+        pts1.reshape(-1, 1, 2).astype(np.float64), H).reshape(-1, 2).astype(np.float32)
 
 
 def opencv_photo_like(im_pil, seed=0):
@@ -438,18 +619,19 @@ def opencv_photo_like(im_pil, seed=0):
     merged = (bg_with_shadow.astype(np.float32) * (1 - alpha_paper) + canvas.astype(
         np.float32) * alpha_paper).astype(np.uint8)
 
-    # 5. 整体透视变换（修改点：连带背景一起透视）
-    # 以纸张的四个角为基准，计算透视矩阵，并作用于整张图
+    # 5. 整体透视变换（连带背景一起透视）
+    # 模拟"手机斜着拍一张"：给虚拟相机加一点俯仰/偏航/滚转，再算单应矩阵。
+    # 之前是四个角各推一个随机量 —— 幅度小的时候出来就是个平行四边形，
+    # 对边两两平行，一眼看着像被剪切过而不是拍出来的。相机模型下对边必然收敛。
     pts1 = np.float32([
         [pad_x, pad_y],
         [pad_x + w, pad_y],
         [pad_x, pad_y + h],
         [pad_x + w, pad_y + h]
     ])
-    offset = PERSPECTIVE_OFFSET
     o = PERSPECTIVE_OFFSET
     if o > 0:
-        pts2 = pts1 + np.random.randint(-o, o, size=(4, 2)).astype(np.float32)
+        pts2 = perspective_corners(pts1, o, rnd)
     else:
         pts2 = pts1.copy()          # 0 = 不做透视；randint(-0, 0) 会直接抛异常
     M = cv2.getPerspectiveTransform(pts1, pts2)
@@ -516,7 +698,7 @@ def opencv_photo_like(im_pil, seed=0):
 
 
 # ================= 主程序 =================
-images = handwrite(text, template, seed=seed)
+images = render_pages()
 
 if not os.path.exists(out_dir):
     os.makedirs(out_dir)

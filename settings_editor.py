@@ -6,12 +6,14 @@
 
 预设：可以把当前这一整套存成 .json，之后载回来；「恢复默认」回到代码里的初值。
 """
+import copy
 import json
 import os
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, ttk
 
 from mask_editor import _shared_root
+from paper_tab import PaperTab
 from param_widgets import COLOR_KEYS, ParamPanel, load_preset, save_preset
 
 SETTINGS_FILE = "handwrite_settings.json"       # 「记住修改」存这里
@@ -33,15 +35,7 @@ SECTIONS = [
         ("fallback_scale", "回退字号比例", "float", 0.3, 3.0, 0.05),
         ("fallback_thin", "回退笔画磨细", "int", 0, 4, 1),
     ]),
-    ("纸张", [
-        ("paper_color", "纸色", "color", 0, 0, 0),
-        ("rule_color", "横线色", "color", 0, 0, 0),
-        ("rule_width", "横线粗细", "int", 0, 12, 1),
-        ("side_line_color", "竖线色", "color", 0, 0, 0),
-        ("side_line_width", "竖线粗细", "int", 0, 12, 1),
-        ("grain_sigma", "纸纹强度", "int", 0, 40, 1),
-        ("grain_alpha", "纸纹浓度", "float", 0, 0.5, 0.01),
-    ]),
+    # 纸张相关（生成纸参数 / 真纸图片 / 写字区域）全在「纸张」那一页里，见 PaperTab
     ("手写抖动", [
         ("fill", "墨色", "color", 0, 0, 0),
         ("word_spacing", "字间距", "int", -20, 60, 1),
@@ -73,8 +67,9 @@ SECTIONS = [
 
 class SettingsEditor(object):
     def __init__(self, defaults):
-        self.defaults = dict(defaults)
-        self.values = dict(defaults)
+        # deepcopy：blocks 是嵌套的 list[dict]，浅拷贝会让界面直接改到默认值上
+        self.defaults = copy.deepcopy(defaults)
+        self.values = copy.deepcopy(defaults)
         self.root = _shared_root()
         self.remembered = self._load_remembered()
 
@@ -126,9 +121,16 @@ class SettingsEditor(object):
         tk.Button(size, text="字号/行距按宽度重算", command=self._rescale_font
                   ).pack(side="left", padx=8)
 
+        # 分两页：「常规」是参数和正文，「纸张」在预览图上拖写字区域
+        nb = ttk.Notebook(win)
+        nb.pack(side="top", fill="both", expand=True, padx=8, pady=6)
+        self.nb = nb
+        tab1 = tk.Frame(nb)
+        nb.add(tab1, text="  常规  ")
+
         # 参数区做成可滚动的：参数多，窗口放不下
-        body = tk.Frame(win)
-        body.pack(side="top", fill="both", expand=True, padx=8, pady=6)
+        body = tk.Frame(tab1)
+        body.pack(side="top", fill="both", expand=True)
         canvas = tk.Canvas(body, highlightthickness=0)
         vsb = tk.Scrollbar(body, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas)
@@ -155,13 +157,27 @@ class SettingsEditor(object):
         tbox.pack(fill="both", expand=True, pady=3)
         tbar = tk.Frame(tbox)
         tbar.pack(fill="x")
-        tk.Button(tbar, text="导入模板 .txt", command=self._import_text).pack(side="left")
-        tk.Button(tbar, text="导出模板 .txt", command=self._export_text).pack(side="left", padx=2)
-        tk.Label(tbar, text="（也可以直接在下面改；改过的会被记住）",
-                 fg="#777").pack(side="left", padx=6)
+        self._text_btns = []
+        for txt, cmd in (("导入模板 .txt", self._import_text),
+                         ("导出模板 .txt", self._export_text)):
+            b = tk.Button(tbar, text=txt, command=cmd)
+            b.pack(side="left", padx=(0, 2))
+            self._text_btns.append(b)
+        self.text_note = tk.Label(tbar, text="（也可以直接在下面改；改过的会被记住）",
+                                  fg="#777")
+        self.text_note.pack(side="left", padx=6)
         self.text_widget = tk.Text(tbox, height=12, wrap="word", undo=True)
         self.text_widget.pack(fill="both", expand=True, pady=(3, 0))
         self.text_widget.insert("1.0", self.values.get("text") or "")
+        self._sync_text_state()
+
+        # 第二页：纸张
+        tab2 = tk.Frame(nb)
+        nb.add(tab2, text="  纸张  ")
+        self.paper_tab = PaperTab(tab2, self.values, on_change=self._changed)
+        self.paper_tab.frame.pack(fill="both", expand=True)
+        self.panels.append(self.paper_tab.gen_panel)
+        nb.bind("<<NotebookTabChanged>>", lambda e: self.paper_tab.refit())
 
         foot = tk.Frame(win)
         foot.pack(side="bottom", fill="x", padx=8, pady=6)
@@ -230,6 +246,21 @@ class SettingsEditor(object):
 
     def _changed(self):
         self._say("")
+        self._sync_text_state()
+
+    def _sync_text_state(self):
+        """定义了写字区域之后，正文就不在「常规」页这里了 —— 得说清楚，
+        否则用户会以为在这儿打的字会自动流进某个区域。"""
+        has = bool(self.values.get("blocks"))
+        self.text_widget.config(state="disabled" if has else "normal")
+        for b in getattr(self, "_text_btns", []):
+            b.config(state="disabled" if has else "normal")
+        self.text_note.config(
+            text=("⚠ 已经在「纸张」页定义了 %d 个写字区域 —— "
+                  "正文由各区域的「这一块写什么」决定，这里的内容不再生效。"
+                  % len(self.values.get("blocks"))) if has
+            else "（也可以直接在下面改；改过的会被记住）",
+            fg="#c0392b" if has else "#777")
 
     def _say(self, msg):
         if getattr(self, "status", None) is not None:
@@ -246,26 +277,30 @@ class SettingsEditor(object):
         path = load_preset(self._win, self.values)
         if not path:
             return
-        self.text_widget.delete("1.0", "end")
-        self.text_widget.insert("1.0", self.values.get("text") or "")
-        self._sync()
+        self._reload_widgets()
         self._say("已载入预设：%s" % path)
 
     def _reset(self):
-        for key, val in self.defaults.items():
-            self.values[key] = tuple(val) if key in COLOR_KEYS and isinstance(val, (list, tuple)) \
-                else val
+        self.values.clear()
+        self.values.update(copy.deepcopy(self.defaults))
         self._forget()                  # 连"记住的修改"一起清掉，否则下次又冒出来
+        self._reload_widgets()
+        self._say("已恢复成代码里的默认值，并清掉了记住的修改。")
+
+    def _reload_widgets(self):
+        """values 被整体换过之后，把两个页面的控件都同步过来。"""
         self.text_widget.delete("1.0", "end")
         self.text_widget.insert("1.0", self.values.get("text") or "")
         self._sync()
-        self._say("已恢复成代码里的默认值，并清掉了记住的修改。")
+        self.paper_tab.reload()          # 纸张页的控件不在 self.panels 里，得单独同步
+        self._sync_text_state()
 
     # ------------------------------------------------------------------ 收尾
     def _do_ok(self):
         for p in self.panels:
             p.fire_now()
         self._grab_text()
+        self.paper_tab.commit()
         try:                            # 记住这次的修改，下次开自动带出来
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump({k: (list(v) if k in COLOR_KEYS and isinstance(v, (list, tuple)) else v)
