@@ -88,7 +88,7 @@
 **3.9 或更高**（实测 3.9.13）。tkinter 是标准库自带的，Windows 上用 [python.org](https://www.python.org/downloads/) 的安装包默认就装了，**不需要额外装**。
 
 ```bash
-git clone https://github.com/<你的用户名>/handright-photo.git
+git clone https://github.com/SCP173JThePeanut/handright-photo.git
 cd handright-photo
 ```
 
